@@ -61,7 +61,7 @@ class ScanScreen(Screen):
 
     BINDINGS = [
         Binding("r", "rescan", "Rescan"),
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
     ]
 
     def __init__(self, auto_mac: Optional[str] = None, auto_name: Optional[str] = None):
@@ -71,7 +71,7 @@ class ScanScreen(Screen):
         self._scanned: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, icon="⚡")
         with Vertical(id="scan-container"):
             yield Label("[bold]Bluetti Dashboard[/bold]", id="scan-title")
             yield Label("Scanning for Bluetti devices...", id="scan-status")
@@ -232,8 +232,7 @@ class DashboardScreen(Screen):
 
     BINDINGS = [
         Binding("r", "rescan", "Rescan"),
-        Binding("q", "quit", "Quit"),
-        Binding("d", "disconnect", "Disconnect"),
+        Binding("q", "app.quit", "Quit"),
     ]
 
     def __init__(self, mac: str, name: str):
@@ -245,7 +244,7 @@ class DashboardScreen(Screen):
         self._poll_count = 0
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, icon="⚡")
         with Vertical(id="dash-container"):
             yield Label(f"Connecting to {self.device_name}...", id="connection-status")
             with Horizontal(id="dash-main"):
@@ -265,6 +264,10 @@ class DashboardScreen(Screen):
 
     def on_mount(self) -> None:
         self.run_worker(self._connect_and_poll(), exclusive=True)
+
+    def on_unmount(self) -> None:
+        if self._client and self._client.client:
+            asyncio.get_event_loop().create_task(self._client.client.disconnect())
 
     async def _connect_and_poll(self) -> None:
         status = self.query_one("#connection-status", Label)
@@ -346,11 +349,7 @@ class DashboardScreen(Screen):
 
     async def action_rescan(self) -> None:
         self.app.pop_screen()
-        self.app.push_screen(ScanScreen(auto_mac=None, auto_name=None))
-
-    async def action_disconnect(self) -> None:
-        self.app.pop_screen()
-        self.app.push_screen(ScanScreen(auto_mac=None, auto_name=None))
+        self.app.push_screen(ScanScreen())
 
 
 # ── Main App ────────────────────────────────────────────────────────────────
