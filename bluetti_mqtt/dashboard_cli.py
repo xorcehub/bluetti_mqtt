@@ -29,8 +29,9 @@ from textual.widgets import (
 from bluetti_mqtt.bluetooth import BluetoothClient, build_device, DEVICE_NAME_RE
 from bluetti_mqtt.bluetooth.exc import BadConnectionError, ModbusError, ParseError
 
-CONFIG_PATH = Path.home() / ".bluetti_dashboard.json"
-LOG_DIR = Path.home() / ".bluetti_logs"
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_DIR / "dashboard.json"
+LOG_DIR = PROJECT_DIR / "logs"
 
 POLL_INTERVAL = 2.0
 SPARKLINE_WIDTH = 50
