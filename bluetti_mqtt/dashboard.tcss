@@ -68,6 +68,11 @@ BatteryWidget, PowerFlowWidget, StatusWidget, InfoWidget {
     padding: 0 1;
 }
 
+AlertWidget {
+    padding: 0 1;
+    height: auto;
+}
+
 Header {
     background: $primary;
 }

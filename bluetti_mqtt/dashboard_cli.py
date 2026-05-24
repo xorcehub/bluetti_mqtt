@@ -28,6 +28,7 @@ from textual.widgets import (
 
 from bluetti_mqtt.bluetooth import BluetoothClient, build_device, DEVICE_NAME_RE
 from bluetti_mqtt.bluetooth.exc import BadConnectionError, ModbusError, ParseError
+from bluetti_mqtt.core.devices.eb3a import ChargingMode, LedMode
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_DIR / "dashboard.json"
@@ -50,6 +51,9 @@ DEVICE_CAPACITY_WH = {
 DEFAULT_LOG_INTERVAL = 30
 DEFAULT_HISTORY_HOURS = 6
 DEFAULT_SPARKLINE_WIDTH = 50
+DEFAULT_ALERT_FULL = 100
+DEFAULT_ALERT_LOW = 20
+DEFAULT_ALERT_CRITICAL = 10
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
@@ -64,6 +68,12 @@ def load_config() -> dict:
             cfg.setdefault("logging_enabled", True)
             cfg.setdefault("history_hours", DEFAULT_HISTORY_HOURS)
             cfg.setdefault("sparkline_width", DEFAULT_SPARKLINE_WIDTH)
+            cfg.setdefault("alert_full", DEFAULT_ALERT_FULL)
+            cfg.setdefault("alert_low", DEFAULT_ALERT_LOW)
+            cfg.setdefault("alert_critical", DEFAULT_ALERT_CRITICAL)
+            cfg.setdefault("led_sos_full", False)
+            cfg.setdefault("led_sos_low", False)
+            cfg.setdefault("led_sos_critical", False)
             return cfg
         except (json.JSONDecodeError, OSError):
             pass
@@ -103,7 +113,7 @@ def append_log(device_type: str, data: dict) -> None:
     try:
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")
-    except OSError:
+    except (OSError, TypeError):
         pass
 
 
@@ -295,6 +305,20 @@ class SparklineWidget(Static):
     pass
 
 
+class AlertWidget(Static):
+    pass
+
+
+def render_alert(pct: int, cfg: dict) -> str:
+    if pct <= cfg.get("alert_critical", DEFAULT_ALERT_CRITICAL):
+        return f"[bold red]!! Battery critical ({pct}%) !![/]"
+    if pct <= cfg.get("alert_low", DEFAULT_ALERT_LOW):
+        return f"[bold yellow]! Battery low ({pct}%)[/]"
+    if pct >= cfg.get("alert_full", DEFAULT_ALERT_FULL):
+        return f"[bold green]Fully charged ({pct}%)[/]"
+    return ""
+
+
 def render_battery(val: int) -> str:
     bar_len = 30
     filled = int(bar_len * val / 100)
@@ -378,6 +402,11 @@ class DashboardScreen(Screen):
         Binding("r", "rescan", "Rescan"),
         Binding("q", "app.quit", "Quit"),
         Binding("l", "toggle_logging", "Toggle log"),
+        Binding("a", "toggle_ac", "AC on/off"),
+        Binding("d", "toggle_dc", "DC on/off"),
+        Binding("e", "toggle_eco", "Eco on/off"),
+        Binding("c", "cycle_charging", "Charge mode"),
+        Binding("m", "cycle_led", "LED mode"),
     ]
 
     def __init__(self, mac: str, name: str):
@@ -390,7 +419,11 @@ class DashboardScreen(Screen):
         self._battery_history: list[float] = []
         self._last_log_time: float = 0
         self._last_sparkline_time: float = 0
+        self._last_frame: dict = {}
         self._cfg = load_config()
+        self._led_alert_active: bool = False
+        self._led_mode_before_alert = None
+        self._prev_pct: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon="⚡")
@@ -416,6 +449,7 @@ class DashboardScreen(Screen):
                 classes="section-title",
             )
             yield SparklineWidget(id="sparkline-widget")
+            yield AlertWidget(id="alert-widget")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -541,13 +575,96 @@ class DashboardScreen(Screen):
                 await asyncio.sleep(POLL_INTERVAL)
 
     def _update_widgets(self, data: dict) -> None:
+        self._last_frame = data
         pct = data.get("total_battery_percent", 0)
         if isinstance(pct, int):
             self.query_one("#battery-widget", BatteryWidget).update(render_battery(pct))
+            alert = render_alert(pct, self._cfg)
+            self.query_one("#alert-widget", AlertWidget).update(alert)
+            self._check_led_alert(pct, data)
 
         self.query_one("#info-widget", InfoWidget).update(render_info(data))
         self.query_one("#power-widget", PowerFlowWidget).update(render_power_flow(data))
         self.query_one("#status-widget", StatusWidget).update(render_status(data))
+
+    def _in_alert_range(self, pct: int) -> bool:
+        cfg = self._cfg
+        if pct >= cfg.get("alert_full", DEFAULT_ALERT_FULL) and cfg.get("led_sos_full", False):
+            return True
+        if pct <= cfg.get("alert_low", DEFAULT_ALERT_LOW) and cfg.get("led_sos_low", False):
+            return True
+        if pct <= cfg.get("alert_critical", DEFAULT_ALERT_CRITICAL) and cfg.get("led_sos_critical", False):
+            return True
+        return False
+
+    def _check_led_alert(self, pct: int, data: dict) -> None:
+        if not self._device or not self._client or not self._client.is_ready:
+            return
+
+        # Skip on first poll — only trigger on actual threshold crossings
+        if self._prev_pct is None:
+            self._prev_pct = pct
+            return
+
+        was_in = self._in_alert_range(self._prev_pct)
+        now_in = self._in_alert_range(pct)
+        self._prev_pct = pct
+
+        if now_in and not was_in and not self._led_alert_active:
+            # Crossed into alert range
+            self._led_mode_before_alert = data.get("led_mode")
+            asyncio.get_event_loop().create_task(
+                self._send_command("led_mode", "SOS")
+            )
+            self._led_alert_active = True
+        elif not now_in and was_in and self._led_alert_active:
+            # Crossed out of alert range
+            restore = self._led_mode_before_alert or LedMode.OFF
+            mode_name = restore.name if isinstance(restore, LedMode) else "OFF"
+            asyncio.get_event_loop().create_task(
+                self._send_command("led_mode", mode_name)
+            )
+            self._led_alert_active = False
+
+    async def _send_command(self, field: str, value) -> None:
+        if not self._device or not self._client or not self._client.is_ready:
+            return
+        try:
+            cmd = self._device.build_setter_command(field, value)
+            await self._client.perform_nowait(cmd)
+        except Exception:
+            pass
+
+    async def action_toggle_ac(self) -> None:
+        current = self._last_frame.get("ac_output_on")
+        if current is not None:
+            await self._send_command("ac_output_on", not current)
+
+    async def action_toggle_dc(self) -> None:
+        current = self._last_frame.get("dc_output_on")
+        if current is not None:
+            await self._send_command("dc_output_on", not current)
+
+    async def action_toggle_eco(self) -> None:
+        current = self._last_frame.get("eco_on")
+        if current is not None:
+            await self._send_command("eco_on", not current)
+
+    async def action_cycle_charging(self) -> None:
+        current = self._last_frame.get("charging_mode")
+        if current is not None:
+            modes = list(ChargingMode)
+            idx = modes.index(current) if current in modes else 0
+            next_mode = modes[(idx + 1) % len(modes)]
+            await self._send_command("charging_mode", next_mode.name)
+
+    async def action_cycle_led(self) -> None:
+        current = self._last_frame.get("led_mode")
+        if current is not None:
+            modes = list(LedMode)
+            idx = modes.index(current) if current in modes else 0
+            next_mode = modes[(idx + 1) % len(modes)]
+            await self._send_command("led_mode", next_mode.name)
 
     async def action_rescan(self) -> None:
         self.app.pop_screen()
