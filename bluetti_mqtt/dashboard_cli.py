@@ -6,6 +6,7 @@ Live monitoring via Bluetooth BLE using the bluetti_mqtt backend.
 import argparse
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -24,16 +25,32 @@ from textual.widgets import (
     ListView,
     Static,
 )
-from rich.bar import Bar
-from rich.text import Text
 
 from bluetti_mqtt.bluetooth import BluetoothClient, build_device, DEVICE_NAME_RE
 from bluetti_mqtt.bluetooth.exc import BadConnectionError, ModbusError, ParseError
-from bluetti_mqtt.core.commands import ReadHoldingRegisters
 
 CONFIG_PATH = Path.home() / ".bluetti_dashboard.json"
+LOG_DIR = Path.home() / ".bluetti_logs"
 
 POLL_INTERVAL = 2.0
+SPARKLINE_WIDTH = 50
+
+DEVICE_CAPACITY_WH = {
+    "EB3A": 268,
+    "AC200M": 2048,
+    "AC300": 3000,
+    "AC500": 4600,
+    "AC60": 403,
+    "EP500": 5100,
+    "EP500P": 5100,
+    "EP600": 5120,
+}
+
+DEFAULT_LOG_INTERVAL = 30
+DEFAULT_HISTORY_HOURS = 6
+DEFAULT_SPARKLINE_WIDTH = 50
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -41,17 +58,136 @@ POLL_INTERVAL = 2.0
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text())
+            cfg = json.loads(CONFIG_PATH.read_text())
+            cfg.setdefault("log_interval", DEFAULT_LOG_INTERVAL)
+            cfg.setdefault("logging_enabled", True)
+            cfg.setdefault("history_hours", DEFAULT_HISTORY_HOURS)
+            cfg.setdefault("sparkline_width", DEFAULT_SPARKLINE_WIDTH)
+            return cfg
         except (json.JSONDecodeError, OSError):
             pass
-    return {}
+    return {"log_interval": DEFAULT_LOG_INTERVAL, "logging_enabled": True}
 
 
-def save_config(mac: str, name: str) -> None:
+def save_config(mac: str = None, name: str = None, **kwargs) -> None:
+    cfg = load_config()
+    if mac is not None:
+        cfg["last_mac"] = mac
+    if name is not None:
+        cfg["last_name"] = name
+    cfg.update(kwargs)
     try:
-        CONFIG_PATH.write_text(json.dumps({"last_mac": mac, "last_name": name}, indent=2))
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except OSError:
         pass
+
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+
+def log_path(device_type: str) -> Path:
+    return LOG_DIR / device_type / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+
+
+def append_log(device_type: str, data: dict) -> None:
+    path = log_path(device_type)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "battery": data.get("total_battery_percent"),
+        "dc_in": data.get("dc_input_power", 0),
+        "ac_in": data.get("ac_input_power", 0),
+        "ac_out": data.get("ac_output_power", 0),
+        "dc_out": data.get("dc_output_power", 0),
+    }
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def load_today_log(device_type: str) -> list[dict]:
+    path = log_path(device_type)
+    if not path.exists():
+        return []
+    entries = []
+    try:
+        for line in path.read_text().splitlines():
+            if line.strip():
+                entries.append(json.loads(line))
+    except (json.JSONDecodeError, OSError):
+        pass
+    # Only keep last 6 hours
+    cutoff = datetime.now().timestamp() - load_config().get("history_hours", DEFAULT_HISTORY_HOURS) * 3600
+    return [e for e in entries if datetime.fromisoformat(e["ts"]).timestamp() >= cutoff]
+
+
+# ── Sparkline ───────────────────────────────────────────────────────────────
+
+def render_sparkline(values: list[float], width: int = None, label: str = "") -> str:
+    if width is None:
+        width = load_config().get("sparkline_width", DEFAULT_SPARKLINE_WIDTH)
+    if not values:
+        return f"  {label}[dim]no data yet[/]"
+
+    lo = min(values)
+    hi = max(values)
+
+    n = len(values)
+    if n > width:
+        step = n / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = values
+
+    chars = []
+    for v in sampled:
+        idx = min(int(v / 100 * (len(SPARK_CHARS) - 1)), len(SPARK_CHARS) - 1)
+        idx = max(idx, 0)
+        chars.append(SPARK_CHARS[idx])
+
+    return f"  {label}[green]{''.join(chars)}[/] [dim]{lo:.0f}–{hi:.0f}%[/]"
+
+
+# ── Time estimate ───────────────────────────────────────────────────────────
+
+def render_time_estimate(data: dict) -> str:
+    pct = data.get("total_battery_percent", 0)
+    dtype = data.get("device_type", "")
+    if not isinstance(pct, int) or pct < 0:
+        return ""
+
+    capacity_wh = DEVICE_CAPACITY_WH.get(dtype)
+    if not capacity_wh:
+        return ""
+
+    dc_in = (data.get("dc_input_power") or 0)
+    ac_in = (data.get("ac_input_power") or 0)
+    ac_out = (data.get("ac_output_power") or 0)
+    dc_out = (data.get("dc_output_power") or 0)
+    net = dc_in + ac_in - ac_out - dc_out
+
+    if net == 0:
+        return "  Estimate: [dim]no power flow[/]"
+
+    if net > 0:
+        remaining_wh = capacity_wh * (100 - pct) / 100
+        hours = remaining_wh / net
+        return f"  Estimate: [bold green]{_fmt_hours(hours)}[/] until full ({net:+d}W)"
+    else:
+        remaining_wh = capacity_wh * pct / 100
+        hours = remaining_wh / abs(net)
+        return f"  Estimate: [bold red]{_fmt_hours(hours)}[/] until empty ({net:+d}W)"
+
+
+def _fmt_hours(h: float) -> str:
+    if h < 1:
+        return f"{int(h * 60)}min"
+    hrs = int(h)
+    mins = int((h - hrs) * 60)
+    if mins:
+        return f"{hrs}h {mins}min"
+    return f"{hrs}h"
 
 
 # ── Scan Screen ─────────────────────────────────────────────────────────────
@@ -106,7 +242,9 @@ class ScanScreen(Screen):
 
         lv = self.query_one("#device-list", ListView)
         if not bluetti:
-            self.query_one("#scan-status", Label).update("[yellow]No Bluetti devices found. Press R to rescan.[/yellow]")
+            self.query_one("#scan-status", Label).update(
+                "[yellow]No Bluetti devices found. Press R to rescan.[/yellow]"
+            )
             return
 
         self._scanned = bluetti
@@ -152,6 +290,10 @@ class InfoWidget(Static):
     pass
 
 
+class SparklineWidget(Static):
+    pass
+
+
 def render_battery(val: int) -> str:
     bar_len = 30
     filled = int(bar_len * val / 100)
@@ -180,6 +322,7 @@ def render_power_flow(d: dict) -> str:
         f"  DC Out:        {'[bold red]-' + str(dc_out) + 'W[/]' if dc_out else '[dim]0W[/]'}",
         "",
         f"  Net: [bold green]+{net}W[/] (charging)" if net >= 0 else f"  Net: [bold red]{net}W[/] (discharging)",
+        render_time_estimate(d),
     ]
     return "\n".join(lines)
 
@@ -233,6 +376,7 @@ class DashboardScreen(Screen):
     BINDINGS = [
         Binding("r", "rescan", "Rescan"),
         Binding("q", "app.quit", "Quit"),
+        Binding("l", "toggle_logging", "Toggle log"),
     ]
 
     def __init__(self, mac: str, name: str):
@@ -242,6 +386,10 @@ class DashboardScreen(Screen):
         self._client: Optional[BluetoothClient] = None
         self._device = None
         self._poll_count = 0
+        self._battery_history: list[float] = []
+        self._last_log_time: float = 0
+        self._last_sparkline_time: float = 0
+        self._cfg = load_config()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon="⚡")
@@ -260,6 +408,13 @@ class DashboardScreen(Screen):
                     yield Label("")
                     yield Label("[bold]Status[/bold]", classes="section-title")
                     yield StatusWidget(id="status-widget")
+            yield Label("")
+            history_h = load_config().get('history_hours', DEFAULT_HISTORY_HOURS)
+            yield Label(
+                f"[bold]Battery History (last {history_h}h)[/bold]",
+                classes="section-title",
+            )
+            yield SparklineWidget(id="sparkline-widget")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -291,9 +446,18 @@ class DashboardScreen(Screen):
             status.update(f"[red]Scan error: {e}[/red]")
             return
 
+        # Load today's log history for sparkline
+        dtype = self._device.type if self._device else ""
+        history = load_today_log(dtype)
+        self._battery_history = [e["battery"] for e in history if e.get("battery") is not None]
+        if self._battery_history:
+            self.query_one("#sparkline-widget", SparklineWidget).update(
+                render_sparkline(self._battery_history)
+            )
+
         # Start BLE client
         self._client = BluetoothClient(self.mac)
-        client_task = asyncio.get_running_loop().create_task(self._client.run())
+        asyncio.get_running_loop().create_task(self._client.run())
 
         # Wait for ready
         status.update(f"Connecting to {self.device_name}...")
@@ -319,16 +483,53 @@ class DashboardScreen(Screen):
                         body = cmd.parse_response(response)
                         parsed = self._device.parse(cmd.starting_address, body)
                         frame.update(parsed)
-                    except (ModbusError, ParseError, BadConnectionError, asyncio.TimeoutError):
+                    except (
+                        ModbusError, ParseError, BadConnectionError,
+                        asyncio.TimeoutError,
+                    ):
                         pass
 
                 if frame:
                     self._poll_count += 1
                     self._update_widgets(frame)
 
+                    # Log at configured interval
+                    now = asyncio.get_event_loop().time()
+                    log_interval = self._cfg.get("log_interval", DEFAULT_LOG_INTERVAL)
+                    if (self._cfg.get("logging_enabled", True)
+                            and (now - self._last_log_time) >= log_interval):
+                        append_log(dtype, frame)
+                        self._last_log_time = now
+
+                    # Update sparkline at same interval
+                    pct = frame.get("total_battery_percent")
+                    if (isinstance(pct, (int, float))
+                            and (now - self._last_sparkline_time) >= log_interval):
+                        self._battery_history.append(float(pct))
+                        history_h = self._cfg.get(
+                            "history_hours", DEFAULT_HISTORY_HOURS
+                        )
+                        max_points = int(
+                            history_h * 3600 / log_interval
+                        )
+                        if len(self._battery_history) > max_points:
+                            self._battery_history = self._battery_history[-max_points:]
+                        self.query_one("#sparkline-widget", SparklineWidget).update(
+                            render_sparkline(self._battery_history)
+                        )
+                        self._last_sparkline_time = now
+
                 # Update connection indicator
+                log_state = (
+                    "log:on" if self._cfg.get("logging_enabled", True)
+                    else "log:off"
+                )
                 if self._client.is_ready:
-                    status.update(f"[bold green]Connected[/] — {self.device_name} ({self.mac}) [dim]poll #{self._poll_count} | {len(frame)} fields[/]")
+                    status.update(
+                        f"[bold green]Connected[/] — {self.device_name}"
+                        f" ({self.mac}) [dim]poll #{self._poll_count}"
+                        f" | {log_state}[/]"
+                    )
                 else:
                     status.update("[yellow]Reconnecting...[/]")
 
@@ -350,6 +551,11 @@ class DashboardScreen(Screen):
     async def action_rescan(self) -> None:
         self.app.pop_screen()
         self.app.push_screen(ScanScreen())
+
+    def action_toggle_logging(self) -> None:
+        current = self._cfg.get("logging_enabled", True)
+        self._cfg["logging_enabled"] = not current
+        save_config(logging_enabled=not current)
 
 
 # ── Main App ────────────────────────────────────────────────────────────────
