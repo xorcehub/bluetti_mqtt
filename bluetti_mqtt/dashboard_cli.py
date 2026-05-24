@@ -13,7 +13,6 @@ from bleak import BleakScanner
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import (
     Button,
@@ -138,117 +137,92 @@ class ScanScreen(Screen):
 # ── Dashboard Widgets ───────────────────────────────────────────────────────
 
 class BatteryWidget(Static):
-    """Battery percentage with visual bar."""
-
-    percent: reactive[int] = reactive(0)
-
-    def watch_percent(self, val: int) -> None:
-        bar_len = 30
-        filled = int(bar_len * val / 100)
-        empty = bar_len - filled
-        if val >= 80:
-            color = "green"
-        elif val >= 40:
-            color = "yellow"
-        else:
-            color = "red"
-        bar_str = f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/]"
-        self.update(f"[bold]{val:3d}%[/bold] {bar_str}")
+    pass
 
 
 class PowerFlowWidget(Static):
-    """Shows input/output power with arrows."""
-
-    data: reactive[dict] = reactive({})
-
-    def watch_data(self, val: dict) -> None:
-        dc_in = val.get("dc_input_power", 0)
-        ac_in = val.get("ac_input_power", 0)
-        ac_out = val.get("ac_output_power", 0)
-        dc_out = val.get("dc_output_power", 0)
-        total_in = dc_in + ac_in
-        net = total_in - ac_out - dc_out
-
-        lines = []
-        if dc_in > 0:
-            lines.append(f"  DC In (solar): [bold green]+{dc_in}W[/]")
-        else:
-            lines.append(f"  DC In (solar):  [dim]0W[/]")
-        if ac_in > 0:
-            lines.append(f"  AC In:         [bold green]+{ac_in}W[/]")
-        else:
-            lines.append(f"  AC In:          [dim]0W[/]")
-        if ac_out > 0:
-            lines.append(f"  AC Out:        [bold red]-{ac_out}W[/]")
-        else:
-            lines.append(f"  AC Out:         [dim]0W[/]")
-        if dc_out > 0:
-            lines.append(f"  DC Out:        [bold red]-{dc_out}W[/]")
-        else:
-            lines.append(f"  DC Out:         [dim]0W[/]")
-
-        lines.append("")
-        if net >= 0:
-            lines.append(f"  Net: [bold green]+{net}W[/] (charging)")
-        else:
-            lines.append(f"  Net: [bold red]{net}W[/] (discharging)")
-
-        self.update("\n".join(lines))
+    pass
 
 
 class StatusWidget(Static):
-    """On/off status flags."""
-
-    data: reactive[dict] = reactive({})
-
-    def watch_data(self, val: dict) -> None:
-        def _flag(name: str, key: str) -> str:
-            v = val.get(key)
-            if v is True:
-                return f"  {name}: [bold green]ON[/]"
-            elif v is False:
-                return f"  {name}: [dim]OFF[/]"
-            return f"  {name}: [dim]--[/]"
-
-        lines = [
-            _flag("AC Output", "ac_output_on"),
-            _flag("DC Output", "dc_output_on"),
-            _flag("Eco Mode", "eco_on"),
-            _flag("Power Lifting", "power_lifting_on"),
-        ]
-
-        eco = val.get("eco_shutdown")
-        if eco is not None:
-            lines.append(f"  Eco Timeout: {eco.name.replace('_', ' ').title()}")
-
-        charge = val.get("charging_mode")
-        if charge is not None:
-            lines.append(f"  Charging: {charge.name.title()}")
-
-        led = val.get("led_mode")
-        if led is not None:
-            lines.append(f"  LED: {led.name.title()}")
-
-        self.update("\n".join(lines))
+    pass
 
 
 class InfoWidget(Static):
-    """Device info header."""
+    pass
 
-    data: reactive[dict] = reactive({})
 
-    def watch_data(self, val: dict) -> None:
-        dtype = val.get("device_type", "???")
-        sn = val.get("serial_number", "---")
-        arm = val.get("arm_version", "---")
-        dsp = val.get("dsp_version", "---")
-        ac_v = val.get("ac_input_voltage", "---")
-        dc_v = val.get("internal_dc_input_voltage", "---")
-        self.update(
-            f"[bold]{dtype}[/]  SN: {sn}\n"
-            f"ARM: {arm}  DSP: {dsp}\n"
-            f"AC In Voltage: {ac_v}V  DC In Voltage: {dc_v}V"
-        )
+def render_battery(val: int) -> str:
+    bar_len = 30
+    filled = int(bar_len * val / 100)
+    empty = bar_len - filled
+    if val >= 80:
+        color = "green"
+    elif val >= 40:
+        color = "yellow"
+    else:
+        color = "red"
+    bar_str = f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/]"
+    return f"[bold]{val:3d}%[/bold] {bar_str}"
+
+
+def render_power_flow(d: dict) -> str:
+    dc_in = d.get("dc_input_power", 0) or 0
+    ac_in = d.get("ac_input_power", 0) or 0
+    ac_out = d.get("ac_output_power", 0) or 0
+    dc_out = d.get("dc_output_power", 0) or 0
+    net = dc_in + ac_in - ac_out - dc_out
+
+    lines = [
+        f"  DC In (solar): {'[bold green]+' + str(dc_in) + 'W[/]' if dc_in else '[dim]0W[/]'}",
+        f"  AC In:         {'[bold green]+' + str(ac_in) + 'W[/]' if ac_in else '[dim]0W[/]'}",
+        f"  AC Out:        {'[bold red]-' + str(ac_out) + 'W[/]' if ac_out else '[dim]0W[/]'}",
+        f"  DC Out:        {'[bold red]-' + str(dc_out) + 'W[/]' if dc_out else '[dim]0W[/]'}",
+        "",
+        f"  Net: [bold green]+{net}W[/] (charging)" if net >= 0 else f"  Net: [bold red]{net}W[/] (discharging)",
+    ]
+    return "\n".join(lines)
+
+
+def render_status(d: dict) -> str:
+    def _flag(name, key):
+        v = d.get(key)
+        if v is True:
+            return f"  {name}: [bold green]ON[/]"
+        elif v is False:
+            return f"  {name}: [dim]OFF[/]"
+        return f"  {name}: [dim]--[/]"
+
+    lines = [
+        _flag("AC Output", "ac_output_on"),
+        _flag("DC Output", "dc_output_on"),
+        _flag("Eco Mode", "eco_on"),
+        _flag("Power Lifting", "power_lifting_on"),
+    ]
+    eco = d.get("eco_shutdown")
+    if eco is not None:
+        lines.append(f"  Eco Timeout: {eco.name.replace('_', ' ').title()}")
+    charge = d.get("charging_mode")
+    if charge is not None:
+        lines.append(f"  Charging: {charge.name.title()}")
+    led = d.get("led_mode")
+    if led is not None:
+        lines.append(f"  LED: {led.name.title()}")
+    return "\n".join(lines)
+
+
+def render_info(d: dict) -> str:
+    dtype = d.get("device_type", "???")
+    sn = d.get("serial_number", "---")
+    arm = d.get("arm_version", "---")
+    dsp = d.get("dsp_version", "---")
+    ac_v = d.get("ac_input_voltage", "---")
+    dc_v = d.get("internal_dc_input_voltage", "---")
+    return (
+        f"[bold]{dtype}[/]  SN: {sn}\n"
+        f"ARM: {arm}  DSP: {dsp}\n"
+        f"AC In Voltage: {ac_v}V  DC In Voltage: {dc_v}V"
+    )
 
 
 # ── Dashboard Screen ────────────────────────────────────────────────────────
@@ -268,7 +242,7 @@ class DashboardScreen(Screen):
         self.device_name = name
         self._client: Optional[BluetoothClient] = None
         self._device = None
-        self._poll_task: Optional[asyncio.Task] = None
+        self._poll_count = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -289,12 +263,8 @@ class DashboardScreen(Screen):
                     yield StatusWidget(id="status-widget")
         yield Footer()
 
-    async def on_mount(self) -> None:
-        self._poll_task = asyncio.create_task(self._connect_and_poll())
-
-    def on_unmount(self) -> None:
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
+    def on_mount(self) -> None:
+        self.run_worker(self._connect_and_poll(), exclusive=True)
 
     async def _connect_and_poll(self) -> None:
         status = self.query_one("#connection-status", Label)
@@ -336,24 +306,26 @@ class DashboardScreen(Screen):
         save_config(self.mac, self.device_name)
 
         # Poll loop
-        merged: dict = {}
         while True:
             try:
+                frame = {}
                 for cmd in self._device.polling_commands:
                     try:
                         future = await self._client.perform(cmd)
                         response = await asyncio.wait_for(future, timeout=10.0)
                         body = cmd.parse_response(response)
                         parsed = self._device.parse(cmd.starting_address, body)
-                        merged.update(parsed)
+                        frame.update(parsed)
                     except (ModbusError, ParseError, BadConnectionError, asyncio.TimeoutError):
                         pass
 
-                self._update_widgets(merged)
+                if frame:
+                    self._poll_count += 1
+                    self._update_widgets(frame)
 
                 # Update connection indicator
                 if self._client.is_ready:
-                    status.update(f"[bold green]Connected[/] — {self.device_name} ({self.mac})")
+                    status.update(f"[bold green]Connected[/] — {self.device_name} ({self.mac}) [dim]poll #{self._poll_count} | {len(frame)} fields[/]")
                 else:
                     status.update("[yellow]Reconnecting...[/]")
 
@@ -366,11 +338,11 @@ class DashboardScreen(Screen):
     def _update_widgets(self, data: dict) -> None:
         pct = data.get("total_battery_percent", 0)
         if isinstance(pct, int):
-            self.query_one("#battery-widget", BatteryWidget).percent = pct
+            self.query_one("#battery-widget", BatteryWidget).update(render_battery(pct))
 
-        self.query_one("#info-widget", InfoWidget).data = data
-        self.query_one("#power-widget", PowerFlowWidget).data = data
-        self.query_one("#status-widget", StatusWidget).data = data
+        self.query_one("#info-widget", InfoWidget).update(render_info(data))
+        self.query_one("#power-widget", PowerFlowWidget).update(render_power_flow(data))
+        self.query_one("#status-widget", StatusWidget).update(render_status(data))
 
     async def action_rescan(self) -> None:
         self.app.pop_screen()
