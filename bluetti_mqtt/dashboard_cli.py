@@ -117,7 +117,7 @@ def append_log(device_type: str, data: dict) -> None:
         pass
 
 
-def load_today_log(device_type: str) -> list[dict]:
+def load_today_log(device_type: str, history_hours: int = DEFAULT_HISTORY_HOURS) -> list[dict]:
     path = log_path(device_type)
     if not path.exists():
         return []
@@ -128,8 +128,7 @@ def load_today_log(device_type: str) -> list[dict]:
                 entries.append(json.loads(line))
     except (json.JSONDecodeError, OSError):
         pass
-    # Only keep last 6 hours
-    cutoff = datetime.now().timestamp() - load_config().get("history_hours", DEFAULT_HISTORY_HOURS) * 3600
+    cutoff = datetime.now().timestamp() - history_hours * 3600
     return [e for e in entries if datetime.fromisoformat(e["ts"]).timestamp() >= cutoff]
 
 
@@ -414,6 +413,7 @@ class DashboardScreen(Screen):
         self.mac = mac
         self.device_name = name
         self._client: Optional[BluetoothClient] = None
+        self._client_task: Optional[asyncio.Task] = None
         self._device = None
         self._poll_count = 0
         self._battery_history: list[float] = []
@@ -453,48 +453,73 @@ class DashboardScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._cache_widgets()
         self.run_worker(self._connect_and_poll(), exclusive=True)
 
     def on_unmount(self) -> None:
-        if self._client and self._client.client:
-            asyncio.get_event_loop().create_task(self._client.client.disconnect())
+        if self._client_task and not self._client_task.done():
+            self._client_task.cancel()
+
+    def _cache_widgets(self) -> None:
+        self._status_label = self.query_one("#connection-status", Label)
+        self._battery_w = self.query_one("#battery-widget", BatteryWidget)
+        self._info_w = self.query_one("#info-widget", InfoWidget)
+        self._power_w = self.query_one("#power-widget", PowerFlowWidget)
+        self._status_w = self.query_one("#status-widget", StatusWidget)
+        self._sparkline_w = self.query_one("#sparkline-widget", SparklineWidget)
+        self._alert_w = self.query_one("#alert-widget", AlertWidget)
 
     async def _connect_and_poll(self) -> None:
-        status = self.query_one("#connection-status", Label)
+        status = self._status_label
 
-        # Discover and build device
+        while True:
+            while not await self._discover_device(status):
+                status.update("[yellow]Device not found, retrying in 10s...[/]")
+                await asyncio.sleep(10)
+
+            # Load today's log history for sparkline
+            dtype = self._device.type if self._device else ""
+            history = load_today_log(dtype, self._cfg.get("history_hours", DEFAULT_HISTORY_HOURS))
+            self._battery_history = [e["battery"] for e in history if e.get("battery") is not None]
+            if self._battery_history:
+                self._sparkline_w.update(render_sparkline(self._battery_history))
+
+            if not await self._connect(status):
+                return
+
+            stale = await self._poll_loop(status)
+            if stale:
+                # Restart connection from scratch
+                status.update("[yellow]Restarting connection...[/]")
+                await self._teardown_client()
+                continue
+            break
+
+    async def _discover_device(self, status: Label) -> bool:
         try:
             devices = await BleakScanner.discover(timeout=8.0)
             matched = [d for d in devices if d.address == self.mac]
             if not matched:
                 status.update(f"[red]Device {self.mac} not found. Press R to rescan.[/red]")
-                return
+                return False
 
             ble_dev = matched[0]
             if ble_dev.name and DEVICE_NAME_RE.match(ble_dev.name):
                 self._device = build_device(self.mac, ble_dev.name)
                 self.device_name = ble_dev.name
+                return True
             else:
                 status.update(f"[red]Device {self.mac} is not a recognized Bluetti.[/red]")
-                return
+                return False
         except Exception as e:
             status.update(f"[red]Scan error: {e}[/red]")
-            return
+            return False
 
-        # Load today's log history for sparkline
-        dtype = self._device.type if self._device else ""
-        history = load_today_log(dtype)
-        self._battery_history = [e["battery"] for e in history if e.get("battery") is not None]
-        if self._battery_history:
-            self.query_one("#sparkline-widget", SparklineWidget).update(
-                render_sparkline(self._battery_history)
-            )
-
-        # Start BLE client
+    async def _connect(self, status: Label) -> bool:
+        await self._teardown_client()
         self._client = BluetoothClient(self.mac)
-        asyncio.get_running_loop().create_task(self._client.run())
+        self._client_task = asyncio.get_running_loop().create_task(self._client.run())
 
-        # Wait for ready
         status.update(f"Connecting to {self.device_name}...")
         for _ in range(30):
             if self._client.is_ready:
@@ -502,19 +527,38 @@ class DashboardScreen(Screen):
             await asyncio.sleep(1)
         else:
             status.update("[red]Connection timed out. Press R to rescan.[/red]")
-            return
+            return False
 
         status.update(f"[bold green]Connected[/] — {self.device_name} ({self.mac})")
         save_config(self.mac, self.device_name)
+        return True
 
-        # Poll loop
+    async def _teardown_client(self) -> None:
+        if self._client_task and not self._client_task.done():
+            self._client_task.cancel()
+            try:
+                await self._client_task
+            except asyncio.CancelledError:
+                pass
+        if self._client and self._client.client:
+            try:
+                await asyncio.wait_for(self._client.client.disconnect(), timeout=3.0)
+            except Exception:
+                pass
+        self._client = None
+        self._client_task = None
+
+    async def _poll_loop(self, status: Label) -> bool:
+        """Returns True if exited due to stale data (caller should reconnect)."""
+        dtype = self._device.type if self._device else ""
+        stale_count = 0
         while True:
             try:
                 frame = {}
                 for cmd in self._device.polling_commands:
                     try:
                         future = await self._client.perform(cmd)
-                        response = await asyncio.wait_for(future, timeout=10.0)
+                        response = await asyncio.wait_for(future, timeout=3.0)
                         body = cmd.parse_response(response)
                         parsed = self._device.parse(cmd.starting_address, body)
                         frame.update(parsed)
@@ -525,11 +569,12 @@ class DashboardScreen(Screen):
                         pass
 
                 if frame:
+                    stale_count = 0
                     self._poll_count += 1
                     self._update_widgets(frame)
 
                     # Log at configured interval
-                    now = asyncio.get_event_loop().time()
+                    now = asyncio.get_running_loop().time()
                     log_interval = self._cfg.get("log_interval", DEFAULT_LOG_INTERVAL)
                     if (self._cfg.get("logging_enabled", True)
                             and (now - self._last_log_time) >= log_interval):
@@ -549,17 +594,28 @@ class DashboardScreen(Screen):
                         )
                         if len(self._battery_history) > max_points:
                             self._battery_history = self._battery_history[-max_points:]
-                        self.query_one("#sparkline-widget", SparklineWidget).update(
+                        self._sparkline_w.update(
                             render_sparkline(self._battery_history)
                         )
                         self._last_sparkline_time = now
+                else:
+                    stale_count += 1
+
+                if stale_count >= 2:
+                    return True
 
                 # Update connection indicator
                 log_state = (
                     "log:on" if self._cfg.get("logging_enabled", True)
                     else "log:off"
                 )
-                if self._client.is_ready:
+                if stale_count >= 1:
+                    status.update(
+                        f"[bold red]No data ({stale_count} stale)[/] —"
+                        f" {self.device_name} ({self.mac})"
+                        f" [dim]poll #{self._poll_count} | {log_state}[/]"
+                    )
+                elif self._client.is_ready:
                     status.update(
                         f"[bold green]Connected[/] — {self.device_name}"
                         f" ({self.mac}) [dim]poll #{self._poll_count}"
@@ -573,19 +629,20 @@ class DashboardScreen(Screen):
                 break
             except Exception:
                 await asyncio.sleep(POLL_INTERVAL)
+        return False
 
     def _update_widgets(self, data: dict) -> None:
         self._last_frame = data
         pct = data.get("total_battery_percent", 0)
         if isinstance(pct, int):
-            self.query_one("#battery-widget", BatteryWidget).update(render_battery(pct))
+            self._battery_w.update(render_battery(pct))
             alert = render_alert(pct, self._cfg)
-            self.query_one("#alert-widget", AlertWidget).update(alert)
+            self._alert_w.update(alert)
             self._check_led_alert(pct, data)
 
-        self.query_one("#info-widget", InfoWidget).update(render_info(data))
-        self.query_one("#power-widget", PowerFlowWidget).update(render_power_flow(data))
-        self.query_one("#status-widget", StatusWidget).update(render_status(data))
+        self._info_w.update(render_info(data))
+        self._power_w.update(render_power_flow(data))
+        self._status_w.update(render_status(data))
 
     def _in_alert_range(self, pct: int) -> bool:
         cfg = self._cfg
@@ -613,7 +670,7 @@ class DashboardScreen(Screen):
         if now_in and not was_in and not self._led_alert_active:
             # Crossed into alert range
             self._led_mode_before_alert = data.get("led_mode")
-            asyncio.get_event_loop().create_task(
+            asyncio.get_running_loop().create_task(
                 self._send_command("led_mode", "SOS")
             )
             self._led_alert_active = True
@@ -621,7 +678,7 @@ class DashboardScreen(Screen):
             # Crossed out of alert range
             restore = self._led_mode_before_alert or LedMode.OFF
             mode_name = restore.name if isinstance(restore, LedMode) else "OFF"
-            asyncio.get_event_loop().create_task(
+            asyncio.get_running_loop().create_task(
                 self._send_command("led_mode", mode_name)
             )
             self._led_alert_active = False
@@ -672,8 +729,11 @@ class DashboardScreen(Screen):
 
     def action_toggle_logging(self) -> None:
         current = self._cfg.get("logging_enabled", True)
-        self._cfg["logging_enabled"] = not current
-        save_config(logging_enabled=not current)
+        self._save_cfg(logging_enabled=not current)
+
+    def _save_cfg(self, **kwargs) -> None:
+        self._cfg.update(kwargs)
+        save_config(**kwargs)
 
 
 # ── Main App ────────────────────────────────────────────────────────────────

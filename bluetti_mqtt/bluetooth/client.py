@@ -80,8 +80,12 @@ class BluetoothClient:
             logging.info(f'Connected to device: {self.address}')
         except BleakDeviceNotFoundError:
             logging.debug(f'Error connecting to device {self.address}: Not found')
+            await asyncio.sleep(1)
         except (BleakError, EOFError, asyncio.TimeoutError):
             logging.exception(f'Error connecting to device {self.address}:')
+            await asyncio.sleep(1)
+        except Exception:
+            logging.exception(f'Unexpected error connecting to {self.address}:')
             await asyncio.sleep(1)
 
     async def _get_name(self):
@@ -162,8 +166,22 @@ class BluetoothClient:
 
     async def _disconnect(self):
         await self.client.disconnect()
+        # Drain stale commands whose callers have already timed out waiting.
+        # Kept for: brief BLE glitches where the state machine recovers on its
+        # own, and standalone library use outside the dashboard. The dashboard
+        # handles full BT adapter toggles by cancelling run() and starting a
+        # fresh client, but this path still applies for transient errors.
+        while True:
+            try:
+                cmd, cmd_future = self.command_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_exception(BadConnectionError('Disconnected'))
+            self.command_queue.task_done()
         logging.warn(f'Delayed reconnect to {self.address} after error')
         await asyncio.sleep(5)
+        self.client = BleakClient(self.address)
         self.state = ClientState.NOT_CONNECTED
 
     def _notification_handler(self, _sender: int, data: bytearray):
