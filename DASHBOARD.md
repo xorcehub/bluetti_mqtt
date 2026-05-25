@@ -9,11 +9,13 @@ A terminal-based TUI dashboard for live monitoring and control of Bluetti power 
 - **Live monitoring** — battery, power flow, device info, status (2s poll interval)
 - **Persistent logging** — JSONL logs with configurable interval (default 30s)
 - **Battery history** — sparkline chart showing last 6 hours (configurable)
+- **Power flow history** — separate input (AC+DC) and output (AC+DC) sparklines
 - **Time estimates** — charge/discharge time based on current power flow and device capacity
 - **Control commands** — toggle AC/DC output, eco mode, charging mode, LED mode
 - **Battery alerts** — visual alerts for full/low/critical thresholds
 - **LED SOS alerts** — automatically activate LED SOS when battery hits a threshold
 - **Bluetooth resilience** — automatic reconnection after BT adapter toggles or transient errors
+- **Solar shading detection** — rolling 5s baseline + peak tracking with visual and optional LED SOS alerts
 
 ## Supported Devices
 
@@ -83,7 +85,9 @@ All settings are stored in `dashboard.json` in the project root. Edit directly o
   "alert_critical": 10,
   "led_sos_full": false,
   "led_sos_low": false,
-  "led_sos_critical": false
+  "led_sos_critical": false,
+  "shade_alert_pct": 30,
+  "led_sos_shade": false
 }
 ```
 
@@ -101,13 +105,15 @@ All settings are stored in `dashboard.json` in the project root. Edit directly o
 | `led_sos_full` | false | Activate LED SOS when battery reaches full threshold |
 | `led_sos_low` | false | Activate LED SOS when battery reaches low threshold |
 | `led_sos_critical` | false | Activate LED SOS when battery reaches critical threshold |
+| `shade_alert_pct` | 30 | Max % solar power drop (over 5s) before shade alert |
+| `led_sos_shade` | false | Activate LED SOS when solar shading is detected |
 
 ## Data Logging
 
 Logs are stored in `logs/{DEVICE_TYPE}/YYYY-MM-DD.jsonl`. Each entry:
 
 ```json
-{"ts": "2026-05-25T14:30:00.123456", "battery": 85, "dc_in": 45, "ac_in": 0, "ac_out": 98, "dc_out": 12}
+{"ts": "2026-05-25T14:30:00.123456", "battery": 85, "dc_in": 45, "dc_peak": 100, "dc_peak_ts": "2026-05-25T12:00:00", "ac_in": 0, "ac_out": 98, "dc_out": 12}
 ```
 
 | Field | Description |
@@ -115,6 +121,8 @@ Logs are stored in `logs/{DEVICE_TYPE}/YYYY-MM-DD.jsonl`. Each entry:
 | `ts` | ISO timestamp |
 | `battery` | Battery percentage |
 | `dc_in` | DC input power (W) — typically solar |
+| `dc_peak` | Peak DC input since charging started (W) |
+| `dc_peak_ts` | Timestamp when peak was hit |
 | `ac_in` | AC input power (W) |
 | `ac_out` | AC output power (W) |
 | `dc_out` | DC output power (W) |
@@ -171,7 +179,7 @@ This bypasses issues with the Windows BLE stack where GATT notification subscrip
 - [ ] Device-agnostic control commands (look up enums from device class at runtime)
 - [ ] Reverse engineer EB3A registers 136-209 for temperature, cell voltages, battery current
 - [ ] More data fields in logs once discovered
-- [ ] Solar shading detection — alert when DC input fluctuates beyond a configurable % within a configurable time window, indicating partial shading (with optional LED SOS)
+- [x] Solar shading detection — alert when DC input fluctuates beyond a configurable % within a configurable time window, indicating partial shading (with optional LED SOS)
 - [ ] Multiple device support
 - [ ] Power lifting toggle (P key) — EB3A supports it, just needs a binding
 - [ ] Export logs to CSV

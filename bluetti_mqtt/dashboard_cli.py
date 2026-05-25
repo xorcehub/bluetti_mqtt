@@ -54,6 +54,7 @@ DEFAULT_SPARKLINE_WIDTH = 50
 DEFAULT_ALERT_FULL = 100
 DEFAULT_ALERT_LOW = 20
 DEFAULT_ALERT_CRITICAL = 10
+DEFAULT_SHADE_ALERT_PCT = 30
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
@@ -74,6 +75,8 @@ def load_config() -> dict:
             cfg.setdefault("led_sos_full", False)
             cfg.setdefault("led_sos_low", False)
             cfg.setdefault("led_sos_critical", False)
+            cfg.setdefault("shade_alert_pct", DEFAULT_SHADE_ALERT_PCT)
+            cfg.setdefault("led_sos_shade", False)
             return cfg
         except (json.JSONDecodeError, OSError):
             pass
@@ -99,13 +102,15 @@ def log_path(device_type: str) -> Path:
     return LOG_DIR / device_type / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
 
 
-def append_log(device_type: str, data: dict) -> None:
+def append_log(device_type: str, data: dict, solar_peak: float = None, solar_peak_ts: str = None) -> None:
     path = log_path(device_type)
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": datetime.now().isoformat(),
         "battery": data.get("total_battery_percent"),
         "dc_in": data.get("dc_input_power", 0),
+        "dc_peak": solar_peak,
+        "dc_peak_ts": solar_peak_ts,
         "ac_in": data.get("ac_input_power", 0),
         "ac_out": data.get("ac_output_power", 0),
         "dc_out": data.get("dc_output_power", 0),
@@ -157,6 +162,33 @@ def render_sparkline(values: list[float], width: int = None, label: str = "") ->
         chars.append(SPARK_CHARS[idx])
 
     return f"  {label}[green]{''.join(chars)}[/] [dim]{lo:.0f}–{hi:.0f}%[/]"
+
+
+def render_power_sparkline(values: list[float], width: int = None,
+                           label: str = "", color: str = "cyan") -> str:
+    if width is None:
+        width = load_config().get("sparkline_width", DEFAULT_SPARKLINE_WIDTH)
+    if not values:
+        return f"  {label}[dim]no data yet[/]"
+
+    lo = min(values)
+    hi = max(values)
+    span = max(hi - lo, 10)
+
+    n = len(values)
+    if n > width:
+        step = n / width
+        sampled = [values[int(i * step)] for i in range(width)]
+    else:
+        sampled = values
+
+    chars = []
+    for v in sampled:
+        idx = int((v - lo) / span * (len(SPARK_CHARS) - 1))
+        idx = max(0, min(idx, len(SPARK_CHARS) - 1))
+        chars.append(SPARK_CHARS[idx])
+
+    return f"  [{color}]{''.join(chars)}[/] {label}[dim]{lo:.0f}W – {hi:.0f}W[/]"
 
 
 # ── Time estimate ───────────────────────────────────────────────────────────
@@ -304,6 +336,10 @@ class SparklineWidget(Static):
     pass
 
 
+class PowerSparklineWidget(Static):
+    pass
+
+
 class AlertWidget(Static):
     pass
 
@@ -316,6 +352,11 @@ def render_alert(pct: int, cfg: dict) -> str:
     if pct >= cfg.get("alert_full", DEFAULT_ALERT_FULL):
         return f"[bold green]Fully charged ({pct}%)[/]"
     return ""
+
+
+def render_shade_alert(current: int, ref: float, label: str = "baseline") -> str:
+    pct = int((ref - current) / ref * 100)
+    return f"[bold yellow]Solar shading detected ({current}W, dropped {pct}% from {ref:.0f}W {label})[/]"
 
 
 def render_battery(val: int) -> str:
@@ -332,15 +373,35 @@ def render_battery(val: int) -> str:
     return f"[bold]{val:3d}%[/bold] {bar_str}"
 
 
-def render_power_flow(d: dict) -> str:
+def render_power_flow(d: dict, shade_active: bool = False,
+                      solar_peak: float = None, solar_peak_ts: str = None) -> str:
     dc_in = d.get("dc_input_power", 0) or 0
     ac_in = d.get("ac_input_power", 0) or 0
     ac_out = d.get("ac_output_power", 0) or 0
     dc_out = d.get("dc_output_power", 0) or 0
     net = dc_in + ac_in - ac_out - dc_out
 
+    if shade_active:
+        solar_label = f"[bold yellow]☁ +{dc_in}W (shaded)[/]"
+    elif dc_in:
+        solar_label = f"[bold green]☀ +{dc_in}W[/]"
+    else:
+        solar_label = "[dim]0W[/]"
+
+    peak_info = ""
+    if solar_peak and dc_in:
+        peak_time = ""
+        if solar_peak_ts:
+            t = datetime.fromisoformat(solar_peak_ts)
+            peak_time = f" at {t.strftime('%H:%M')}"
+        pct = int((solar_peak - dc_in) / solar_peak * 100)
+        peak_info = f"  [dim]peak {solar_peak:.0f}W{peak_time} ({pct}% below)[/]"
     lines = [
-        f"  DC In (solar): {'[bold green]+' + str(dc_in) + 'W[/]' if dc_in else '[dim]0W[/]'}",
+        f"  DC In (solar): {solar_label}",
+    ]
+    if peak_info:
+        lines.append(peak_info)
+    lines += [
         f"  AC In:         {'[bold green]+' + str(ac_in) + 'W[/]' if ac_in else '[dim]0W[/]'}",
         f"  AC Out:        {'[bold red]-' + str(ac_out) + 'W[/]' if ac_out else '[dim]0W[/]'}",
         f"  DC Out:        {'[bold red]-' + str(dc_out) + 'W[/]' if dc_out else '[dim]0W[/]'}",
@@ -417,6 +478,8 @@ class DashboardScreen(Screen):
         self._device = None
         self._poll_count = 0
         self._battery_history: list[float] = []
+        self._power_in_history: list[float] = []
+        self._power_out_history: list[float] = []
         self._last_log_time: float = 0
         self._last_sparkline_time: float = 0
         self._last_frame: dict = {}
@@ -424,6 +487,11 @@ class DashboardScreen(Screen):
         self._led_alert_active: bool = False
         self._led_mode_before_alert = None
         self._prev_pct: Optional[int] = None
+        self._solar_baseline: Optional[float] = None
+        self._solar_peak: Optional[float] = None
+        self._solar_peak_ts: Optional[str] = None
+        self._last_baseline_time: float = 0
+        self._shade_alert_active: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon="⚡")
@@ -449,6 +517,11 @@ class DashboardScreen(Screen):
                 classes="section-title",
             )
             yield SparklineWidget(id="sparkline-widget")
+            yield Label(
+                f"[bold]Power Flow History (last {history_h}h)[/bold]",
+                classes="section-title",
+            )
+            yield PowerSparklineWidget(id="power-sparkline-widget")
             yield AlertWidget(id="alert-widget")
         yield Footer()
 
@@ -467,6 +540,7 @@ class DashboardScreen(Screen):
         self._power_w = self.query_one("#power-widget", PowerFlowWidget)
         self._status_w = self.query_one("#status-widget", StatusWidget)
         self._sparkline_w = self.query_one("#sparkline-widget", SparklineWidget)
+        self._power_sparkline_w = self.query_one("#power-sparkline-widget", PowerSparklineWidget)
         self._alert_w = self.query_one("#alert-widget", AlertWidget)
 
     async def _connect_and_poll(self) -> None:
@@ -477,12 +551,30 @@ class DashboardScreen(Screen):
                 status.update("[yellow]Device not found, retrying in 10s...[/]")
                 await asyncio.sleep(10)
 
-            # Load today's log history for sparkline
+            # Load today's log history for sparklines
             dtype = self._device.type if self._device else ""
             history = load_today_log(dtype, self._cfg.get("history_hours", DEFAULT_HISTORY_HOURS))
             self._battery_history = [e["battery"] for e in history if e.get("battery") is not None]
+            self._power_in_history = [
+                (e.get("dc_in", 0) or 0) + (e.get("ac_in", 0) or 0)
+                for e in history
+            ]
+            self._power_out_history = [
+                (e.get("ac_out", 0) or 0) + (e.get("dc_out", 0) or 0)
+                for e in history
+            ]
             if self._battery_history:
                 self._sparkline_w.update(render_sparkline(self._battery_history))
+            if self._power_in_history:
+                self._power_sparkline_w.update(
+                    render_power_sparkline(
+                        self._power_in_history, color="green", label="In: ",
+                    )
+                    + "\n"
+                    + render_power_sparkline(
+                        self._power_out_history, color="red", label="Out: ",
+                    )
+                )
 
             if not await self._connect(status):
                 return
@@ -547,6 +639,10 @@ class DashboardScreen(Screen):
                 pass
         self._client = None
         self._client_task = None
+        self._solar_baseline = None
+        self._solar_peak = None
+        self._solar_peak_ts = None
+        self._shade_alert_active = False
 
     async def _poll_loop(self, status: Label) -> bool:
         """Returns True if exited due to stale data (caller should reconnect)."""
@@ -578,14 +674,20 @@ class DashboardScreen(Screen):
                     log_interval = self._cfg.get("log_interval", DEFAULT_LOG_INTERVAL)
                     if (self._cfg.get("logging_enabled", True)
                             and (now - self._last_log_time) >= log_interval):
-                        append_log(dtype, frame)
+                        append_log(dtype, frame, self._solar_peak, self._solar_peak_ts)
                         self._last_log_time = now
 
-                    # Update sparkline at same interval
+                    # Update sparklines at same interval
                     pct = frame.get("total_battery_percent")
                     if (isinstance(pct, (int, float))
                             and (now - self._last_sparkline_time) >= log_interval):
                         self._battery_history.append(float(pct))
+                        dc_in = (frame.get("dc_input_power") or 0)
+                        ac_in = (frame.get("ac_input_power") or 0)
+                        ac_out = (frame.get("ac_output_power") or 0)
+                        dc_out = (frame.get("dc_output_power") or 0)
+                        self._power_in_history.append(float(dc_in + ac_in))
+                        self._power_out_history.append(float(ac_out + dc_out))
                         history_h = self._cfg.get(
                             "history_hours", DEFAULT_HISTORY_HOURS
                         )
@@ -594,8 +696,23 @@ class DashboardScreen(Screen):
                         )
                         if len(self._battery_history) > max_points:
                             self._battery_history = self._battery_history[-max_points:]
+                        if len(self._power_in_history) > max_points:
+                            self._power_in_history = self._power_in_history[-max_points:]
+                        if len(self._power_out_history) > max_points:
+                            self._power_out_history = self._power_out_history[-max_points:]
                         self._sparkline_w.update(
                             render_sparkline(self._battery_history)
+                        )
+                        self._power_sparkline_w.update(
+                            render_power_sparkline(
+                                self._power_in_history, color="green",
+                                label="In: ",
+                            )
+                            + "\n"
+                            + render_power_sparkline(
+                                self._power_out_history, color="red",
+                                label="Out: ",
+                            )
                         )
                         self._last_sparkline_time = now
                 else:
@@ -641,8 +758,12 @@ class DashboardScreen(Screen):
             self._check_led_alert(pct, data)
 
         self._info_w.update(render_info(data))
-        self._power_w.update(render_power_flow(data))
+        self._power_w.update(render_power_flow(
+            data, self._shade_alert_active,
+            self._solar_peak, self._solar_peak_ts,
+        ))
         self._status_w.update(render_status(data))
+        self._check_shade_alert(data)
 
     def _in_alert_range(self, pct: int) -> bool:
         cfg = self._cfg
@@ -683,6 +804,70 @@ class DashboardScreen(Screen):
             )
             self._led_alert_active = False
 
+    def _check_shade_alert(self, data: dict) -> None:
+        dc_in = data.get("dc_input_power", 0) or 0
+
+        if dc_in == 0:
+            if self._shade_alert_active:
+                self._restore_led_after_shade()
+            self._solar_baseline = None
+            self._solar_peak = None
+            self._solar_peak_ts = None
+            return
+
+        if self._solar_baseline is None:
+            self._solar_baseline = float(dc_in)
+            self._solar_peak = float(dc_in)
+            self._solar_peak_ts = datetime.now().isoformat()
+            self._last_baseline_time = asyncio.get_running_loop().time()
+            return
+
+        now = asyncio.get_running_loop().time()
+        if now - self._last_baseline_time < 5:
+            return
+
+        threshold = self._cfg.get("shade_alert_pct", DEFAULT_SHADE_ALERT_PCT)
+        rolling_drop = (self._solar_baseline - dc_in) / self._solar_baseline * 100
+        peak_drop = (self._solar_peak - dc_in) / self._solar_peak * 100
+
+        if (rolling_drop >= threshold or peak_drop >= threshold) and not self._shade_alert_active:
+            if peak_drop >= rolling_drop:
+                ref = self._solar_peak
+                label = "peak"
+            else:
+                ref = self._solar_baseline
+                label = "baseline"
+            self._shade_alert_active = True
+            self._alert_w.update(render_shade_alert(dc_in, ref, label))
+            if self._cfg.get("led_sos_shade", False) and not self._led_alert_active:
+                self._led_mode_before_alert = data.get("led_mode")
+                asyncio.get_running_loop().create_task(
+                    self._send_command("led_mode", "SOS")
+                )
+                self._led_alert_active = True
+        elif rolling_drop < threshold and peak_drop < threshold:
+            self._solar_baseline = float(dc_in)
+            if dc_in > self._solar_peak:
+                self._solar_peak = float(dc_in)
+                self._solar_peak_ts = datetime.now().isoformat()
+            if self._shade_alert_active:
+                self._solar_peak = float(dc_in)
+                self._solar_peak_ts = datetime.now().isoformat()
+                self._shade_alert_active = False
+                self._restore_led_after_shade()
+
+        self._last_baseline_time = now
+
+    def _restore_led_after_shade(self) -> None:
+        self._shade_alert_active = False
+        if self._led_alert_active:
+            restore = self._led_mode_before_alert or LedMode.OFF
+            mode_name = restore.name if isinstance(restore, LedMode) else "OFF"
+            asyncio.get_running_loop().create_task(
+                self._send_command("led_mode", mode_name)
+            )
+            self._led_alert_active = False
+
     async def _send_command(self, field: str, value) -> None:
         if not self._device or not self._client or not self._client.is_ready:
             return
@@ -716,6 +901,12 @@ class DashboardScreen(Screen):
             await self._send_command("charging_mode", next_mode.name)
 
     async def action_cycle_led(self) -> None:
+        if self._shade_alert_active:
+            self._shade_alert_active = False
+            self._solar_baseline = None
+            self._solar_peak = None
+            self._solar_peak_ts = None
+            self._alert_w.update("")
         current = self._last_frame.get("led_mode")
         if current is not None:
             modes = list(LedMode)

@@ -73,6 +73,10 @@ AlertWidget {
     height: auto;
 }
 
+SparklineWidget, PowerSparklineWidget {
+    padding: 0 1;
+}
+
 Header {
     background: $primary;
 }
